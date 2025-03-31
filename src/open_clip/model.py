@@ -1,27 +1,59 @@
-""" CLIP Model
+"""
+CLIP Model
 
 Adapted from https://github.com/openai/CLIP. Originally MIT License, Copyright (c) 2021 OpenAI.
 """
+
 import copy
 import logging
 import math
 from dataclasses import dataclass
-from typing import Any, Dict, List, Optional, Tuple, Union
+from functools import partial
+from typing import Any, Dict, Optional, Tuple, Union
 
 import numpy as np
 import torch
 import torch.nn.functional as F
 from torch import nn
 from torch.utils.checkpoint import checkpoint
-from functools import partial
 
 from .hf_model import HFTextEncoder
 from .modified_resnet import ModifiedResNet
 from .timm_model import TimmModel
-from .transformer import LayerNormFp32, LayerNorm, QuickGELU, Attention, VisionTransformer, TextTransformer,\
-    text_global_pool
+from .transformer import (Attention, LayerNorm, LayerNormFp32, QuickGELU,
+                          TextTransformer, VisionTransformer, text_global_pool)
 from .utils import to_2tuple
 
+def text_BDCovpool(x):
+    x = x.permute(0, 2, 1)
+    batchSize, dim, M = x.data.shape
+
+    I = torch.eye(dim, dim, device=x.device).view(1, dim, dim).repeat(batchSize, 1, 1).type(x.dtype)
+    I_M = torch.ones(batchSize, dim, dim, device=x.device).type(x.dtype)
+    x_pow2 = x.bmm(x.transpose(1, 2))
+    dcov = I_M.bmm(x_pow2 * I) + (x_pow2 * I).bmm(I_M) - 2 * x_pow2
+    dcov = torch.clamp(dcov, min=0.0)
+    dcov = 1. / (2 * M) * dcov
+    dcov = torch.sqrt(dcov + 1e-5)
+
+    d1 = dcov.bmm(I_M * 1. / dim)
+    d2 = (I_M * 1. / dim).bmm(dcov)
+    d3 = (I_M * 1. / dim).bmm(dcov).bmm(I_M * 1. / dim)
+
+    out = dcov - d1 - d2 + d3
+    return out
+
+def text_Triuvec(x):
+    batchSize, dim1, dim2 = x.shape
+    assert dim1 == dim2, "Input tensor must have shape (batchsize, dim, dim)"
+    
+    r = x.reshape(batchSize, dim1 * dim2)
+    I = torch.ones(dim1, dim2).triu().reshape(dim1 * dim2)
+    index = I.nonzero(as_tuple=False).squeeze()
+    
+    y = torch.zeros(batchSize, int(dim1 * (dim1 + 1) / 2), device=x.device).type(x.dtype)
+    y = r[:, index]
+    return y
 
 @dataclass
 class CLIPVisionCfg:
@@ -32,27 +64,26 @@ class CLIPVisionCfg:
     patch_size: int = 16
     image_size: Union[Tuple[int, int], int] = 224
 
-    ls_init_value: Optional[float] = None  # layer scale initial value
-    patch_dropout: float = 0.  # what fraction of patches to dropout during training (0 would mean disabled and no patches dropped) - 0.5 to 0.75 recommended in the paper for optimal results
-    attentional_pool: bool = False  # whether to use attentional pooler in the last embedding layer (overrides pool_type)
-    attn_pooler_queries: int = 256  # n_queries for attentional pooler
-    attn_pooler_heads: int = 8  # n heads for attentional_pooling
-    no_ln_pre: bool = False  # disable pre transformer LayerNorm
+    ls_init_value: Optional[float] = None
+    patch_dropout: float = 0.0
+    attentional_pool: bool = False
+    attn_pooler_queries: int = 256
+    attn_pooler_heads: int = 8
+    no_ln_pre: bool = False
     pos_embed_type: str = 'learnable'
-    final_ln_after_pool: bool = False  # apply final LayerNorm after pooling
+    final_ln_after_pool: bool = False
     pool_type: str = 'tok'
     output_tokens: bool = False
     act_kwargs: Optional[dict] = None
     norm_kwargs: Optional[dict] = None
 
-    timm_model_name: Optional[str] = None  # a valid model name overrides layers, width, patch_size
-    timm_model_pretrained: bool = False  # use (imagenet) pretrained weights for named model
-    timm_pool: str = 'avg'  # feature pooling for timm model ('abs_attn', 'rot_attn', 'avg', '')
-    timm_proj: str = 'linear'  # linear projection for timm model output ('linear', 'mlp', '')
-    timm_proj_bias: bool = False  # enable bias final projection
-    timm_drop: float = 0.  # head dropout
-    timm_drop_path: Optional[float] = None  # backbone stochastic depth
-
+    timm_model_name: Optional[str] = None
+    timm_model_pretrained: bool = False
+    timm_pool: str = 'avg'
+    timm_proj: str = 'linear'
+    timm_proj_bias: bool = False
+    timm_drop: float = 0.0
+    timm_drop_path: Optional[float] = None
 
 @dataclass
 class CLIPTextCfg:
@@ -65,24 +96,21 @@ class CLIPTextCfg:
     heads: int = 8
     layers: int = 12
     mlp_ratio: float = 4.0
-    ls_init_value: Optional[float] = None  # layer scale initial value
+    ls_init_value: Optional[float] = None
     embed_cls: bool = False
     pad_id: int = 0
-    no_causal_mask: bool = False  # disable causal masking
-    final_ln_after_pool: bool = False  # apply final LayerNorm after pooling
+    no_causal_mask: bool = False
+    final_ln_after_pool: bool = False
     pool_type: str = 'argmax'
     proj_bias: bool = False
-    proj_type: str = 'linear'  # control final text projection, 'none' forces no projection
     output_tokens: bool = False
     act_kwargs: dict = None
     norm_kwargs: dict = None
 
-    # HuggingFace specific text tower config
     hf_model_name: Optional[str] = None
     hf_model_pretrained: bool = True
     hf_proj_type: str = 'mlp'
-    hf_pooler_type: str = 'mean_pooler'  # attentional pooling for HF models
-
+    hf_pooler_type: str = 'mean_pooler'
 
 def get_cast_dtype(precision: str):
     cast_dtype = None
@@ -92,7 +120,6 @@ def get_cast_dtype(precision: str):
         cast_dtype = torch.float16
     return cast_dtype
 
-
 def get_input_dtype(precision: str):
     input_dtype = None
     if precision in ('bf16', 'pure_bf16'):
@@ -101,19 +128,15 @@ def get_input_dtype(precision: str):
         input_dtype = torch.float16
     return input_dtype
 
-
 def _build_vision_tower(
-        embed_dim: int,
-        vision_cfg: CLIPVisionCfg,
-        quick_gelu: bool = False,
-        cast_dtype: Optional[torch.dtype] = None
+    embed_dim: int,
+    vision_cfg: CLIPVisionCfg,
+    quick_gelu: bool = False,
+    cast_dtype: Optional[torch.dtype] = None
 ):
     if isinstance(vision_cfg, dict):
         vision_cfg = CLIPVisionCfg(**vision_cfg)
 
-    # OpenAI models are pretrained w/ QuickGELU but native nn.GELU is both faster and more
-    # memory efficient in recent PyTorch releases (>= 1.10).
-    # NOTE: timm models always use native GELU regardless of quick_gelu flag.
     act_layer = QuickGELU if quick_gelu else nn.GELU
 
     if vision_cfg.timm_model_name:
@@ -167,15 +190,14 @@ def _build_vision_tower(
             act_layer=act_layer,
             norm_layer=norm_layer,
         )
-
+    
     return visual
 
-
 def _build_text_tower(
-        embed_dim: int,
-        text_cfg: CLIPTextCfg,
-        quick_gelu: bool = False,
-        cast_dtype: Optional[torch.dtype] = None,
+    embed_dim: int,
+    text_cfg: CLIPTextCfg,
+    quick_gelu: bool = False,
+    cast_dtype: Optional[torch.dtype] = None,
 ):
     if isinstance(text_cfg, dict):
         text_cfg = CLIPTextCfg(**text_cfg)
@@ -210,7 +232,6 @@ def _build_text_tower(
             no_causal_mask=text_cfg.no_causal_mask,
             pad_id=text_cfg.pad_id,
             pool_type=text_cfg.pool_type,
-            proj_type=text_cfg.proj_type,
             proj_bias=text_cfg.proj_bias,
             output_tokens=text_cfg.output_tokens,
             act_layer=act_layer,
@@ -218,28 +239,162 @@ def _build_text_tower(
         )
     return text
 
+class textBDC(nn.Module):
+    """
+    A module for text-based Batch-Diagonal Covariance pooling.
+    """
+    def __init__(self, is_vec=True, input_dim=(768,), dimension_reduction=None, activate='relu'):
+        super(textBDC, self).__init__()
+        self.is_vec = is_vec
+        self.dr = dimension_reduction
+        self.activate = activate
+        self.input_dim = input_dim[0]
+        self.num_heads = 4
+        if self.dr is not None and self.dr != self.input_dim:
+            if activate == 'relu':
+                self.act = nn.ReLU(inplace=True)
+            elif activate == 'leaky_relu':
+                self.act = nn.LeakyReLU(0.1)
+            else:
+                self.act = nn.ReLU(inplace=True)
+
+        self.conv_dr_block = nn.Sequential(
+            nn.Linear(self.input_dim // self.num_heads, self.dr, bias=False),
+            nn.LayerNorm(self.dr, eps=1e-7),
+            self.act
+        )
+        output_dim = self.input_dim
+        if self.is_vec:
+            self.output_dim = int(output_dim * (output_dim + 1) / 2)
+        else:
+            self.output_dim = int(output_dim * output_dim)
+        self.ln = nn.LayerNorm(4324, eps=1e-7)
+        self.pre = nn.Dropout2d(0.5)
+        self.down = nn.Linear(4324, 4324, bias=True)
+        self._init_weight()
+
+    def _init_weight(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, a=0, mode='fan_out', nonlinearity='leaky_relu')
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+    
+    def forward(self, x, text):
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.to(device)  
+        x = x.to(device)
+        text = text.to(device)
+        B, L, C = x.shape
+        group_size = C // self.num_heads
+        eot_indices = text.argmax(dim=-1)
+        eot_tokens = x[torch.arange(B), eot_indices]
+        x = x.view(B, L, self.num_heads, group_size)
+        eot_tokens = eot_tokens.view(B, self.num_heads, group_size)
+        outputs = []
+        for i in range(self.num_heads):
+            head = x[:, :, i, :] 
+            eot_head = eot_tokens[:, i, :] 
+            similarity = F.cosine_similarity(eot_head.unsqueeze(1), head, dim=2) 
+            weights = F.softmax(similarity, dim=1).unsqueeze(2)
+            weighted_head = head * weights 
+            if self.dr is not None and self.dr != self.input_dim:
+                weighted_head = self.conv_dr_block(weighted_head)
+            weighted_head = self.pre(weighted_head)
+            head_cov = text_BDCovpool(weighted_head)
+            if self.is_vec:
+                head_out = text_Triuvec(head_cov)
+            else:
+                head_out = head_cov.reshape(B, -1)
+            outputs.append(head_out)
+        x = torch.cat(outputs, dim=1) 
+        x = self.ln(x)
+        x = self.down(x)
+        return x
+
+class Covariance(nn.Module):
+    def __init__(self, remove_mean=True, conv=False):
+        super(Covariance, self).__init__()
+        self.remove_mean = remove_mean
+        self.conv = conv
+
+    def _remove_mean(self, x):
+        x = x.transpose(-1, -2)
+        _mean = F.adaptive_avg_pool2d(x, (1, 1))
+        x = x - _mean
+        x = x.transpose(-1, -2)
+        return x
+
+    def remove_mean_(self, x):
+        _mean = F.adaptive_avg_pool2d(x, (1, 1))
+        x = x - _mean
+        return x
+
+    def _cov(self, x):
+        batchsize, d, N = x.size()
+        x = x.transpose(-1, -2)
+        y = (1. / N) * (x.bmm(x.transpose(1, 2)))
+        return y
+    
+    def _cross_cov(self, x1, x2):
+        batchsize1, N1, d1 = x1.size()
+        batchsize2, N2, d2 = x2.size()
+        assert batchsize1 == batchsize2
+        assert N1 == N2
+        x1 = x1.transpose(-1, -2)
+        x2 = x2.transpose(-1, -2)
+
+        y = (1. / N1) * (x1.bmm(x2.transpose(1, 2)))
+        return y
+    
+    def cross_cov(self, x1, x2):
+        batchsize1, d1, h1, w1 = x1.size()
+        batchsize2, d2, h2, w2 = x2.size()
+        N1 = h1 * w1
+        N2 = h2 * w2
+        assert batchsize1 == batchsize2
+        assert N1 == N2
+        x1 = x1.view(batchsize1, d1, N1)
+        x2 = x2.view(batchsize2, d2, N2)
+
+        y = (1. / N1) * (x1.bmm(x2.transpose(1, 2)))
+        return y
+
+    def forward(self, x, y=None):
+        if self.remove_mean:
+            x = self.remove_mean_(x) if self.conv else self._remove_mean(x)
+            if y is not None:
+                y = self.remove_mean_(y) if self.conv else self._remove_mean(y)
+        if y is not None:
+            if self.conv:
+                x = self.cross_cov(x, y)
+            else:
+                x = self._cross_cov(x, y)
+        else:
+            x = self._cov(x)
+        return x
 
 class CLIP(nn.Module):
     output_dict: torch.jit.Final[bool]
 
     def __init__(
-            self,
-            embed_dim: int,
-            vision_cfg: CLIPVisionCfg,
-            text_cfg: CLIPTextCfg,
-            quick_gelu: bool = False,
-            init_logit_scale: float = np.log(1 / 0.07),
-            init_logit_bias: Optional[float] = None,
-            nonscalar_logit_scale: bool = False,
-            cast_dtype: Optional[torch.dtype] = None,
-            output_dict: bool = False,
+        self,
+        embed_dim: int,
+        vision_cfg: CLIPVisionCfg,
+        text_cfg: CLIPTextCfg,
+        quick_gelu: bool = False,
+        init_logit_scale: float = np.log(1 / 0.07),
+        init_logit_bias: Optional[float] = None,
+        cast_dtype: Optional[torch.dtype] = None,
+        output_dict: bool = False,
     ):
         super().__init__()
         self.output_dict = output_dict
 
         self.visual = _build_vision_tower(embed_dim, vision_cfg, quick_gelu, cast_dtype)
-
         text = _build_text_tower(embed_dim, text_cfg, quick_gelu, cast_dtype)
+
         self.transformer = text.transformer
         self.context_length = text.context_length
         self.vocab_size = text.vocab_size
@@ -249,16 +404,44 @@ class CLIP(nn.Module):
         self.text_projection = text.text_projection
         self.text_pool_type = text.pool_type
         self.register_buffer('attn_mask', text.attn_mask, persistent=False)
+        self.logit_scale = nn.Parameter(torch.ones([]) * init_logit_scale)
+        self.logit_bias = nn.Parameter(torch.ones([]) * init_logit_bias) if init_logit_bias is not None else None
+        self.fc1 = nn.Linear(embed_dim, embed_dim, bias=False)
+        self.tbdc = textBDC(is_vec=True, input_dim=[512, 14, 14], dimension_reduction=46)
+        self.fc2 = nn.Linear(4324, embed_dim, bias=False)
 
-        lshape = [1] if nonscalar_logit_scale else []
-        self.logit_scale = nn.Parameter(torch.ones(lshape) * init_logit_scale)
-        if init_logit_bias is not None:
-            self.logit_bias = nn.Parameter(torch.ones(lshape) * init_logit_bias)
-        else:
-            self.logit_bias = None
+    def extend_text_context(self, new_context_length):
+        """
+        Extend the context length for text processing.
+        """
+        if self.context_length >= new_context_length:
+            return
+
+        embedding_len, width = self.positional_embedding.shape
+        new_param_len = embedding_len - self.context_length + new_context_length
+
+        fixed_length = 20
+        new_positional_embedding = nn.Parameter(torch.empty(new_param_len, width, device=self.positional_embedding.device))
+        new_positional_embedding.data[:fixed_length] = self.positional_embedding.data[:fixed_length]
+
+        need_scale_params = self.positional_embedding.data[fixed_length:]
+        need_scale_params = need_scale_params.unsqueeze(0)
+        need_scale_params = torch.transpose(need_scale_params, 1, 2)
+        scaled_data = F.interpolate(need_scale_params, size=(new_param_len - fixed_length), mode='linear', align_corners=True)
+        scaled_data = torch.transpose(scaled_data, 1, 2)
+        new_positional_embedding.data[fixed_length:] = scaled_data[0]
+
+        self.positional_embedding = new_positional_embedding
+        self.context_length = new_context_length
+        self.attn_mask = torch.empty(new_param_len, new_param_len, device=self.positional_embedding.device)
+        self.attn_mask.fill_(float("-inf"))
+        self.attn_mask.triu_(1)
+
+    def _l2norm(self, x):
+        x = nn.functional.normalize(x, dim=2)
+        return x
 
     def lock_image_tower(self, unlocked_groups=0, freeze_bn_stats=False):
-        # lock image tower as per LiT - https://arxiv.org/abs/2111.07991
         self.visual.lock(unlocked_groups=unlocked_groups, freeze_bn_stats=freeze_bn_stats)
 
     @torch.jit.ignore
@@ -266,161 +449,59 @@ class CLIP(nn.Module):
         self.visual.set_grad_checkpointing(enable)
         self.transformer.grad_checkpointing = enable
 
-    @torch.jit.ignore
-    def no_weight_decay(self):
-        # for timm optimizers, 1d params like logit_scale, logit_bias, ln/bn scale, biases are excluded by default
-        no_wd = {'positional_embedding'}
-        if hasattr(self.visual, 'no_weight_decay'):
-            for n in self.visual.no_weight_decay():
-                no_wd.add('visual.' + n)
-        return no_wd
-
     def encode_image(self, image, normalize: bool = False):
-        features = self.visual(image)
-        return F.normalize(features, dim=-1) if normalize else features
+        features, gcp_output = self.visual(image)
+        if normalize:
+            features = F.normalize(features, dim=-1)
+            gcp_output = F.normalize(gcp_output, dim=-1)
+        return features, gcp_output
 
     def encode_text(self, text, normalize: bool = False):
         cast_dtype = self.transformer.get_cast_dtype()
 
         x = self.token_embedding(text).to(cast_dtype)  # [batch_size, n_ctx, d_model]
-
         x = x + self.positional_embedding.to(cast_dtype)
         x = self.transformer(x, attn_mask=self.attn_mask)
         x = self.ln_final(x)  # [batch_size, n_ctx, transformer.width]
-        x = text_global_pool(x, text, self.text_pool_type)
-        if self.text_projection is not None:
-            if isinstance(self.text_projection, nn.Linear):
-                x = self.text_projection(x)
-            else:
-                x = x @ self.text_projection
 
-        return F.normalize(x, dim=-1) if normalize else x
+        if isinstance(self.text_projection, nn.Linear): 
+            x = self.text_projection(x)
+        else:    
+            x = x @ self.text_projection
+
+        x, tokens = text_global_pool(x, text, pool_type=self.text_pool_type)
+        
+        text_gcp_output = tokens
+        text_gcp_output = self.fc1(text_gcp_output)
+        text_gcp_output = self.tbdc(text_gcp_output, text)
+        text_gcp_output = self.fc2(text_gcp_output)
+
+        if normalize:
+            x = F.normalize(x, dim=-1)
+            text_gcp_output = F.normalize(text_gcp_output, dim=-1)
+        
+        return x, text_gcp_output
 
     def get_logits(self, image, text):
-        image_features = self.encode_image(image, normalize=True)
-        text_features = self.encode_text(text, normalize=True)
+        image_features, _ = self.encode_image(image, normalize=True)
+        text_features, _ = self.encode_text(text, normalize=True)
         image_logits = self.logit_scale.exp() * image_features @ text_features.T
         if self.logit_bias is not None:
             image_logits += self.logit_bias
         text_logits = image_logits.T
         return image_logits, text_logits
 
-    def forward_intermediates(
-            self,
-            image: Optional[torch.Tensor] = None,
-            text: Optional[torch.Tensor] = None,
-            image_indices: Optional[Union[int, List[int]]] = None,
-            text_indices: Optional[Union[int, List[int]]] = None,
-            stop_early: bool = False,
-            normalize: bool = True,
-            normalize_intermediates: bool = False,
-            intermediates_only: bool = False,
-            image_output_fmt: str = 'NCHW',
-            image_output_extra_tokens: bool = False,
-            text_output_fmt: str = 'NLC',
-            text_output_extra_tokens: bool = False,
-            output_logits: bool = False,
-            output_logit_scale_bias: bool = False,
-    ) -> Dict[str, Union[torch.Tensor, List[torch.Tensor]]]:
-        """ Forward features that returns intermediates.
-
-        Args:
-            image: Input image tensor
-            text: Input text tensor
-            image_indices: For image tower, Take last n blocks if int, all if None, select matching indices if sequence
-            text_indices: Take last n blocks if int, all if None, select matching indices if sequence
-            stop_early: Stop iterating over blocks when last desired intermediate hit
-            normalize_intermediates: Apply final norm layer to all intermediates
-            normalize: L2 Normalize final features
-            intermediates_only: Only return intermediate features, do not return final features
-            image_output_fmt: Shape of intermediate image feature outputs
-            image_output_extra_tokens: Return both prefix and spatial intermediate tokens
-            text_output_fmt: Shape of intermediate text feature outputs (ignored for this model)
-            text_output_extra_tokens: Return both prefix and spatial intermediate tokens (ignored for this model)
-            output_logits: Include logits in output
-            output_logit_scale_bias: Include the logit scale bias in the output
-        Returns:
-
-        """
-        output = {}
-        if intermediates_only:
-            # intermediates only disables final feature normalization, and include logits
-            normalize = False
-            output_logits = False
-        if output_logits:
-            assert image is not None and text is not None, 'Both image and text inputs are required to compute logits'
-
-        if image is not None:
-            image_output = self.visual.forward_intermediates(
-                image,
-                indices=image_indices,
-                stop_early=stop_early,
-                normalize_intermediates=normalize_intermediates,
-                intermediates_only=intermediates_only,
-                output_fmt=image_output_fmt,
-                output_extra_tokens=image_output_extra_tokens,
-            )
-            if normalize and "image_features" in image_output:
-                image_output["image_features"] = F.normalize(image_output["image_features"], dim=-1)
-            output.update(image_output)
-
-        if text is not None:
-            cast_dtype = self.transformer.get_cast_dtype()
-            x = self.token_embedding(text).to(cast_dtype)  # [batch_size, n_ctx, d_model]
-            x = x + self.positional_embedding.to(cast_dtype)
-            x, intermediates = self.transformer.forward_intermediates(
-                x,
-                attn_mask=self.attn_mask,
-                indices=text_indices
-            )
-            if normalize_intermediates:
-                intermediates = [self.ln_final(xi) for xi in intermediates]
-
-            # NOTE this model doesn't support cls embed in text transformer, no need for extra intermediate tokens
-            output["text_intermediates"] = intermediates
-
-            if not intermediates_only:
-                x = self.ln_final(x)  # [batch_size, n_ctx, transformer.width]
-                x = text_global_pool(x, text, self.text_pool_type)
-                if self.text_projection is not None:
-                    if isinstance(self.text_projection, nn.Linear):
-                        x = self.text_projection(x)
-                    else:
-                        x = x @ self.text_projection
-                if normalize:
-                    x = F.normalize(x, dim=-1)
-                output["text_features"] = x
-
-        logit_scale_exp = self.logit_scale.exp() if output_logits or output_logit_scale_bias else None
-
-        if output_logits:
-            image_logits = logit_scale_exp * output["image_features"] @ output["text_features"].T
-            if self.logit_bias is not None:
-                image_logits += self.logit_bias
-            text_logits = image_logits.T
-            output["image_logits"] = image_logits
-            output["text_logits"] = text_logits
-
-        if output_logit_scale_bias:
-            output["logit_scale"] = logit_scale_exp
-            if self.logit_bias is not None:
-                output['logit_bias'] = self.logit_bias
-
-        return output
-
-    def forward(
-            self,
-            image: Optional[torch.Tensor] = None,
-            text: Optional[torch.Tensor] = None,
-    ):
-        image_features = self.encode_image(image, normalize=True) if image is not None else None
-        text_features = self.encode_text(text, normalize=True) if text is not None else None
+    def forward(self, image: Optional[torch.Tensor] = None, text: Optional[torch.Tensor] = None):
+        image_features, image_gcp_output = self.encode_image(image, normalize=True) if image is not None else (None, None)
+        text_features, text_gcp_output = self.encode_text(text, normalize=True) if text is not None else (None, None)
 
         if self.output_dict:
             out_dict = {
                 "image_features": image_features,
                 "text_features": text_features,
-                "logit_scale": self.logit_scale.exp()
+                "logit_scale": self.logit_scale.exp(),
+                "image_gcp_output": image_gcp_output,
+                "text_gcp_output": text_gcp_output
             }
             if self.logit_bias is not None:
                 out_dict['logit_bias'] = self.logit_bias
@@ -428,8 +509,7 @@ class CLIP(nn.Module):
 
         if self.logit_bias is not None:
             return image_features, text_features, self.logit_scale.exp(), self.logit_bias
-        return image_features, text_features, self.logit_scale.exp()
-
+        return image_features, text_features, image_gcp_output, text_gcp_output, self.logit_scale.exp()
 
 class CustomTextCLIP(nn.Module):
     output_dict: torch.jit.Final[bool]

@@ -9,7 +9,7 @@ from torch.utils.checkpoint import checkpoint
 
 from .utils import to_2tuple, feature_take_indices
 from .pos_embed import get_2d_sincos_pos_embed
-
+import math
 
 class LayerNormFp32(nn.LayerNorm):
     """Subclass torch's LayerNorm to handle fp16 (by casting to float32 and back)."""
@@ -512,6 +512,132 @@ def _expand_token(token, batch_size: int):
     return token.view(1, 1, -1).expand(batch_size, -1, -1)
 
 
+def Triuvec(x):
+    batchSize, dim, dim = x.shape
+    r = x.reshape(batchSize, dim * dim)
+    I = torch.ones(dim, dim).triu().reshape(dim * dim)
+    index = I.nonzero(as_tuple = False)
+    y = torch.zeros(batchSize, int(dim * (dim + 1) / 2), device=x.device).type(x.dtype)
+    y = r[:, index].squeeze()
+    return y
+
+def BDCovpool(x):
+    batchSize, dim, h, w = x.data.shape
+    M = h * w
+    x = x.reshape(batchSize, dim, M)
+
+    I = torch.eye(dim, dim, device=x.device).view(1, dim, dim).repeat(batchSize, 1, 1).type(x.dtype)
+    I_M = torch.ones(batchSize, dim, dim, device=x.device).type(x.dtype)
+    x_pow2 = x.bmm(x.transpose(1, 2))
+    dcov = I_M.bmm(x_pow2 * I) + (x_pow2 * I).bmm(I_M) - 2 * x_pow2
+    dcov = torch.clamp(dcov, min=0.0)
+    dcov = 1. / (2*M) * dcov
+    dcov = torch.sqrt(dcov + 1e-5)
+    
+    d1 = dcov.bmm(I_M*1./ dim)
+    d2 = (I_M * 1./ dim).bmm(dcov)
+    d3 = (I_M*1./ dim).bmm(dcov).bmm(I_M*1./ dim)
+    
+    out = dcov - d1 - d2 + d3
+    return out
+
+class visionBDC(nn.Module):
+    def __init__(self, is_vec=True, input_dim=(768, 14, 14), dimension_reduction=None, activate='relu'):
+        super(visionBDC, self).__init__()
+        self.is_vec = is_vec
+        self.dr = dimension_reduction
+        self.activate = activate
+        self.input_dim = input_dim[0]
+        self.head = 4
+        if self.dr is not None and self.dr != self.input_dim:
+            if activate == 'relu':
+                self.act = nn.ReLU(inplace=True)
+            elif activate == 'leaky_relu':
+                self.act = nn.LeakyReLU(0.1)
+            else:
+                self.act = nn.ReLU(inplace=True)
+
+        self.conv_dr_block = nn.Sequential(
+            nn.Conv2d(self.input_dim//self.head, self.dr, kernel_size=1, stride=1, bias=False),
+            nn.BatchNorm2d(self.dr),
+            self.act
+        )
+        
+        output_dim = self.dr if self.dr else self.input_dim
+        if self.is_vec:
+            self.output_dim = int(output_dim*(output_dim+1)/2)
+        else:
+            self.output_dim = int(output_dim*output_dim)
+        self.ln = nn.LayerNorm(4324, eps=1e-7)
+        self.pre = nn.Dropout2d(0.5)
+        self.down = nn.Linear(4324,4324,bias=True)
+        self._init_weight()
+    def _init_weight(self):
+        for m in self.modules():
+            if isinstance(m, nn.Conv2d):
+                nn.init.kaiming_normal_(m.weight, a=0, mode='fan_out', nonlinearity='leaky_relu')
+            elif isinstance(m, nn.BatchNorm2d):
+                nn.init.constant_(m.weight, 1)
+                nn.init.constant_(m.bias, 0)
+
+    def forward(self, x):
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        self.to(device)  # Ensure the model and all parameters are on CUDA
+        B, L, C = x.shape  # 输入形状为 (batch_size, 196, 768)
+        # 假设第一个 token 是 cls token
+        cls_token = x[:, 0:1, :]  # (B, 1, C)
+        other_tokens = x[:, 1:, :]  # (B, L-1, C)
+        # 将 cls token 和其他 token 分成多个组
+        group_size = C // self.head
+        cls_groups = cls_token.view(B, self.head, group_size)
+        other_groups = other_tokens.view(B, L-1, self.head, group_size)
+        group_results = []
+        for i in range(self.head):
+            group_tokens = other_groups[:, :, i, :]
+            cls_group = cls_groups[:, i, :]
+            similarity = F.cosine_similarity(cls_group.unsqueeze(1), group_tokens, dim=2)
+            weights = F.softmax(similarity, dim=1).unsqueeze(2)
+            weighted_tokens = group_tokens * weights
+            P = int(math.sqrt(L-1))
+            group_x = weighted_tokens.transpose(1, 2).view(B, group_size, P, P).contiguous().to(device)
+            if self.dr is not None and self.dr != group_size:
+                group_x = self.conv_dr_block(group_x)
+            group_x = self.pre(group_x) 
+            group_x = BDCovpool(group_x)
+            if self.is_vec:
+                group_x = Triuvec(group_x)
+            else:
+                group_x = group_x.reshape(group_x.shape[0], -1)
+            
+            #print(f"Shape of group_x: {group_x.shape}")  # 打印每个 group_x 的形状
+            
+            # 确保 group_x 至少是 2D 张量
+            if group_x.dim() == 1:
+                group_x = group_x.unsqueeze(0)
+            
+            group_results.append(group_x)
+        
+        # 检查所有 group_x 的维度是否一致
+        shapes = [g.shape for g in group_results]
+        #print(f"Shapes of all group_x: {shapes}")
+        
+        # 尝试连接
+        try:
+            x = torch.cat(group_results, dim=1)
+        except IndexError:
+            # 如果连接失败，尝试在第一个维度上连接
+            x = torch.cat(group_results, dim=0)
+            # 根据需要重塑张量
+            x = x.view(B, -1)
+        
+        #print(f"Shape after concatenation: {x.shape}")
+        
+        x = self.ln(x)
+        x = self.down(x)
+        return x
+
+
+
 class VisionTransformer(nn.Module):
     output_tokens: torch.jit.Final[bool]
 
@@ -545,15 +671,9 @@ class VisionTransformer(nn.Module):
         self.grid_size = (image_height // patch_height, image_width // patch_width)
         self.final_ln_after_pool = final_ln_after_pool  # currently ignored w/ attn pool enabled
         self.output_dim = output_dim
-
-        self.conv1 = nn.Conv2d(
-            in_channels=3,
-            out_channels=width,
-            kernel_size=patch_size,
-            stride=patch_size,
-            bias=False,
-        )
-
+        
+        self.conv1 = nn.Conv2d(in_channels=3, out_channels=width, kernel_size=patch_size, stride=patch_size, bias=False)
+    
         # class embeddings and positional embeddings
         scale = width ** -0.5
         self.class_embedding = nn.Parameter(scale * torch.randn(width))
@@ -619,13 +739,16 @@ class VisionTransformer(nn.Module):
             self.attn_pool = None
             pool_dim = width
             self.pool_type = pool_type
-
         self.ln_post = norm_layer(pool_dim)
         self.proj = nn.Parameter(scale * torch.randn(pool_dim, output_dim))
 
-        self.init_parameters()
 
-    def lock(self, unlocked_groups: int = 0, freeze_bn_stats: bool = False):
+        self.fc1 = nn.Linear(pool_dim,pool_dim,bias = False)
+        self.fc2 = nn.Linear(4324,pool_dim,bias = False)
+        self.init_parameters()
+        self.vbdc = visionBDC(is_vec=True,input_dim=[768,14,14],dimension_reduction=46)
+
+    def lock(self, unlocked_groups=0, freeze_bn_stats=False):
         for param in self.parameters():
             param.requires_grad = False
 
@@ -679,27 +802,21 @@ class VisionTransformer(nn.Module):
         pass
 
     @torch.jit.ignore
-    def set_grad_checkpointing(self, enable: bool = True):
+    def set_grad_checkpointing(self, enable=True):
         self.transformer.grad_checkpointing = enable
-
-    @torch.jit.ignore
-    def no_weight_decay(self):
-        # for timm optimizers, 1d params like logit_scale, logit_bias, ln/bn scale, biases are excluded by default
-        no_wd = {'positional_embedding', 'class_embedding'}
-        return no_wd
 
     def _global_pool(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
         if self.pool_type == 'avg':
-            pooled, tokens = x[:, 1:].mean(dim=1), x[:, 1:]
+            pooled, tokens = x[:, 1:].mean(dim=1), x
         elif self.pool_type == 'tok':
-            pooled, tokens = x[:, 0], x[:, 1:]
+            pooled, tokens = x[:, 0], x
         else:
             pooled = tokens = x
 
         return pooled, tokens
 
-    def _embeds(self, x:torch.Tensor) -> torch.Tensor:
-        x = self.conv1(x)  # shape = [*, dim, grid, grid]
+    def forward(self, x: torch.Tensor):
+        x = self.conv1(x)  # shape = [*, width, grid, grid]
         x = x.reshape(x.shape[0], x.shape[1], -1)  # shape = [*, width, grid ** 2]
         x = x.permute(0, 2, 1)  # shape = [*, grid ** 2, width]
 
@@ -707,15 +824,9 @@ class VisionTransformer(nn.Module):
         x = torch.cat([_expand_token(self.class_embedding, x.shape[0]).to(x.dtype), x], dim=1)
         # shape = [*, grid ** 2 + 1, width]
         x = x + self.positional_embedding.to(x.dtype)
-
-        # patch dropout (if active)
         x = self.patch_dropout(x)
-
-        # apply norm before transformer
         x = self.ln_pre(x)
-        return x
-
-    def _pool(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
+        x = self.transformer(x)
         if self.attn_pool is not None:
             if self.attn_pool_contrastive is not None:
                 # This is untested, WIP pooling that should match paper
@@ -737,103 +848,16 @@ class VisionTransformer(nn.Module):
         else:
             x = self.ln_post(x)
             pooled, tokens = self._global_pool(x)
-
-        return pooled, tokens
-
-    def forward_intermediates(
-            self,
-            x: torch.Tensor,
-            indices: Optional[Union[int, List[int]]] = None,
-            stop_early: bool = False,
-            normalize_intermediates: bool = False,
-            intermediates_only: bool = False,
-            output_fmt: str = 'NCHW',
-            output_extra_tokens: bool = False,
-    ) -> Dict[str, Union[torch.Tensor, List[torch.Tensor]]]:
-        """ Forward features that returns intermediates.
-
-        Args:
-            x: Input image tensor
-            indices: Take last n blocks if int, all if None, select matching indices if sequence
-            stop_early: Stop iterating over blocks when last desired intermediate hit
-            intermediates_only: Only return intermediate features
-            normalize_intermediates: Apply final norm layer to all intermediates
-            output_fmt: Shape of intermediate feature outputs
-            output_extra_tokens: Return both extra prefix class tokens
-        Returns:
-
-        """
-        assert output_fmt in ('NCHW', 'NLC'), 'Output format must be one of NCHW or NLC.'
-        reshape = output_fmt == 'NCHW'
-
-        # forward pass
-        B, _, height, width = x.shape
-        x = self._embeds(x)
-        x, intermediates = self.transformer.forward_intermediates(
-            x,
-            indices=indices,
-            stop_early=stop_early,
-        )
-
-        # process intermediates
-        if normalize_intermediates:
-            # apply final norm to all intermediates
-            intermediates = [self.ln_post(xi) for xi in intermediates]
-        num_prefix_tokens = 1  # one class token that's always there (as of now)
-        if num_prefix_tokens:
-            # split prefix (e.g. class, distill) and spatial feature tokens
-            prefix_tokens = [y[:, 0:num_prefix_tokens] for y in intermediates]
-            intermediates = [y[:, num_prefix_tokens:] for y in intermediates]
-        else:
-            prefix_tokens = None
-        if reshape:
-            # reshape to BCHW output format
-            H, W = height // self.patch_size[0], width // self.patch_size[1]
-            intermediates = [y.reshape(B, H, W, -1).permute(0, 3, 1, 2).contiguous() for y in intermediates]
-
-        output = {'image_intermediates': intermediates}
-        if prefix_tokens is not None and output_extra_tokens:
-            output['image_intermediates_prefix'] = prefix_tokens
-
-        if intermediates_only:
-            return output
-
-        pooled, _ = self._pool(x)
-
-        if self.proj is not None:
-            pooled = pooled @ self.proj
-
-        output['image_features'] = pooled
-
-        return output
-
-    def prune_intermediate_layers(
-            self,
-            indices: Union[int, List[int]] = 1,
-            prune_norm: bool = False,
-            prune_head: bool = True,
-    ):
-        """ Prune layers not required for specified intermediates.
-        """
-        take_indices = self.transformer.prune_intermediate_layers(indices)
-        if prune_norm:
-            self.ln_post = nn.Identity()
-        if prune_head:
-            self.proj = None
-        return take_indices
-
-    def forward(self, x: torch.Tensor):
-        x = self._embeds(x)
-        x = self.transformer(x)
-        pooled, tokens = self._pool(x)
-
-        if self.proj is not None:
-            pooled = pooled @ self.proj
-
+            gcp_output = tokens
+        gcp_output = self.fc1(gcp_output)
+        gcp_output = self.vbdc(gcp_output)
+        gcp_output = self.fc2(gcp_output)
         if self.output_tokens:
             return pooled, tokens
-        
-        return pooled
+        if self.proj is not None:
+            pooled = pooled @ self.proj
+            gcp_output = gcp_output @ self.proj
+        return  pooled ,gcp_output
 
 
 def text_global_pool(

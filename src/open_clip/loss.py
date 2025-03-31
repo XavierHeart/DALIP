@@ -66,7 +66,6 @@ def gather_features(
 
 
 class ClipLoss(nn.Module):
-
     def __init__(
             self,
             local_loss=False,
@@ -83,8 +82,6 @@ class ClipLoss(nn.Module):
         self.rank = rank
         self.world_size = world_size
         self.use_horovod = use_horovod
-
-        # cache state
         self.prev_num_logits = 0
         self.labels = {}
 
@@ -101,17 +98,11 @@ class ClipLoss(nn.Module):
             labels = self.labels[device]
         return labels
 
-    def get_logits(self, image_features, text_features, logit_scale):
+    def get_logits(self, image_features, text_features, logit_scale, logit_bias=None):
         if self.world_size > 1:
             all_image_features, all_text_features = gather_features(
-                image_features,
-                text_features,
-                local_loss=self.local_loss,
-                gather_with_grad=self.gather_with_grad,
-                rank=self.rank,
-                world_size=self.world_size,
-                use_horovod=self.use_horovod,
-            )
+                image_features, text_features,
+                self.local_loss, self.gather_with_grad, self.rank, self.world_size, self.use_horovod)
 
             if self.local_loss:
                 logits_per_image = logit_scale * image_features @ all_text_features.T
@@ -123,19 +114,34 @@ class ClipLoss(nn.Module):
             logits_per_image = logit_scale * image_features @ text_features.T
             logits_per_text = logit_scale * text_features @ image_features.T
         
+        if logit_bias is not None:
+            logits_per_image = logits_per_image + logit_bias
+            logits_per_text = logits_per_text + logit_bias.T
+        
         return logits_per_image, logits_per_text
 
-    def forward(self, image_features, text_features, logit_scale, output_dict=False):
-        device = image_features.device
-        logits_per_image, logits_per_text = self.get_logits(image_features, text_features, logit_scale)
+    def forward(self, image_features, text_features, logit_scale, image_gcp_output, text_gcp_output, alpha=0.5, output_dict=False, logit_bias=None):
+        device = image_gcp_output.device
+        
+        logits_per_image, logits_per_text = self.get_logits(image_features, text_features, logit_scale, logit_bias)
 
         labels = self.get_ground_truth(device, logits_per_image.shape[0])
-
-        total_loss = (
+        
+        contrastive_loss = (
             F.cross_entropy(logits_per_image, labels) +
             F.cross_entropy(logits_per_text, labels)
         ) / 2
 
+        so_logits_per_image, so_logits_per_text = self.get_logits(image_gcp_output, text_gcp_output, logit_scale, logit_bias)
+        gcp_labels = self.get_ground_truth(device, so_logits_per_image.shape[0])
+
+        so_loss_image = F.cross_entropy(so_logits_per_image, gcp_labels)
+        so_loss_text = F.cross_entropy(so_logits_per_text, gcp_labels)
+        
+        so_contrastive_loss = (so_loss_image + so_loss_text) / 2
+        so_contrastive_loss = so_contrastive_loss * (1 - alpha)
+        contrastive_loss = contrastive_loss * alpha
+        total_loss = contrastive_loss + so_contrastive_loss
         return {"contrastive_loss": total_loss} if output_dict else total_loss
 
 
