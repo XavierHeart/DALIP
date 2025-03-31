@@ -5,3 +5,8 @@ Recently, Contrastive Language-Image Pre-training (CLIP) has shown promising per
 ![Framework](framework.png)
 
 *a) Overview of our Distribution Alignment-based Language-Image Pre-Training (DALIP) method for biological data. Specifically, DALIP optimizes CLIP models by matching the similarity between feature distribution of image-text pairs, which are efficiently approximated by first- and second-order statistics of token features. Particularly, (b) a Multi-head Brownian Distance Covariance (MBDC) module is presented to efficiently acquire second-order statistics of token features.*
+
+## Acknowledgments
+
+This project is built upon the [OpenCLIP](https://github.com/mlfoundations/open_clip) codebase. We sincerely thank them for their outstanding contribution to the open-source community.
+
