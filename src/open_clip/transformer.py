@@ -741,45 +741,13 @@ class VisionTransformer(nn.Module):
             self.pool_type = pool_type
         self.ln_post = norm_layer(pool_dim)
         self.proj = nn.Parameter(scale * torch.randn(pool_dim, output_dim))
+        #self.proj_1 = nn.Parameter(scale * torch.randn(pool_dim, output_dim))
 
 
-        self.fc1 = nn.Linear(pool_dim,pool_dim,bias = False)
-        self.fc2 = nn.Linear(4324,pool_dim,bias = False)
+        self.fc1 = nn.Linear(512,512,bias = False)
+        self.fc2 = nn.Linear(4324,512,bias = False)
         self.init_parameters()
-        self.vbdc = visionBDC(is_vec=True,input_dim=[768,14,14],dimension_reduction=46)
-
-    def lock(self, unlocked_groups=0, freeze_bn_stats=False):
-        for param in self.parameters():
-            param.requires_grad = False
-
-        if unlocked_groups != 0:
-            groups = [
-                [
-                    self.conv1,
-                    self.class_embedding,
-                    self.positional_embedding,
-                    self.ln_pre,
-                ],
-                *self.transformer.resblocks[:-1],
-                [
-                    self.transformer.resblocks[-1],
-                    self.ln_post,
-                ],
-                self.proj,
-            ]
-
-            def _unlock(x):
-                if isinstance(x, Sequence):
-                    for g in x:
-                        _unlock(g)
-                else:
-                    if isinstance(x, torch.nn.Parameter):
-                        x.requires_grad = True
-                    else:
-                        for p in x.parameters():
-                            p.requires_grad = True
-
-            _unlock(groups[-unlocked_groups:])
+        self.vbdc = visionBDC(is_vec=True,input_dim=[512,14,14],dimension_reduction=46)
 
     def init_parameters(self):
         # FIXME OpenAI CLIP did not define an init for the VisualTransformer
@@ -824,9 +792,11 @@ class VisionTransformer(nn.Module):
         x = torch.cat([_expand_token(self.class_embedding, x.shape[0]).to(x.dtype), x], dim=1)
         # shape = [*, grid ** 2 + 1, width]
         x = x + self.positional_embedding.to(x.dtype)
+
         x = self.patch_dropout(x)
         x = self.ln_pre(x)
         x = self.transformer(x)
+
         if self.attn_pool is not None:
             if self.attn_pool_contrastive is not None:
                 # This is untested, WIP pooling that should match paper
@@ -847,17 +817,16 @@ class VisionTransformer(nn.Module):
             pooled = self.ln_post(pooled)
         else:
             x = self.ln_post(x)
+            if self.proj is not None:
+                x = x @ self.proj
             pooled, tokens = self._global_pool(x)
             gcp_output = tokens
+        if self.output_tokens:
+            return pooled, tokens
         gcp_output = self.fc1(gcp_output)
         gcp_output = self.vbdc(gcp_output)
         gcp_output = self.fc2(gcp_output)
-        if self.output_tokens:
-            return pooled, tokens
-        if self.proj is not None:
-            pooled = pooled @ self.proj
-            gcp_output = gcp_output @ self.proj
-        return  pooled ,gcp_output
+        return pooled, gcp_output
 
 
 def text_global_pool(
