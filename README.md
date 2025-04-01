@@ -11,7 +11,7 @@ Recently, Contrastive Language-Image Pre-training (CLIP) has shown promising per
 - clone
 ```sh
 git clone https://github.com/XavierHeart/DALIP
-cd DALIP/
+cd DALIP-main/
 ```
 - install dependencies
 ```sh
