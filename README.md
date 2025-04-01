@@ -18,13 +18,17 @@ cd DALIP/
 pip install -r requirments.txt
 ```
 
-
 ## Dataset
 
 The PlantMix-13M dataset will be publicly available soon. This dataset contains:
 - 10M plant domain images and text pairs
 - 3M general domain images and text pairs
 - Carefully curated according to data mixing laws
+  
+## Model
+| Model               | Arch.    | Dataset         | ImageNet-1K | Cifar-100 | Cars  | Pets  | Sun397 | General Mean | PlantNet | Fungi | PlantVillage | Med. Leaf | PlantDoc | Plant Mean | Mean  |
+| OpenCLIP            | ViT-B/16 | PlantMix-13M    | 46.8        | 61.3      | 50.2  | 66.2  | 50.1   | 54.9         | 89.9    | 47.0   | 32.3         | 48.9      | 33.0     | 50.2       | 52.6  |
+| DALIP               | ViT-B/16 | PlantMix-13M    | 49.2        | 69.2      | 58.9  | 75.2  | 55.6   | 61.6         | 91.0     | 52.8  | 34.5         | 43.7      | 34.3     | 51.3       | 56.4  |
 
 ## Acknowledgments
 
