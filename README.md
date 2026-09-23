@@ -1,3 +1,5 @@
+
+
 # DALIP
 
 **Distribution Alignment-based Language-Image Pre-Training for Domain-Specific Data**
@@ -32,7 +34,7 @@ pip install -r requirements.txt
 For training-specific dependencies, install:
 
 ```bash
-pip install -r requirements-training.txt
+pip install .[training]
 ```
 
 ## Dataset
